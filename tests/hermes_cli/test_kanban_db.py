@@ -1583,3 +1583,51 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     # Still usable after with-block exit (the leak).
     conn.execute("SELECT 1").fetchone()
     conn.close()  # explicit close to avoid leaking THIS test
+
+
+def test_task_mode_persists_and_surfaces_worker_contract(kanban_home):
+    with kb.connect() as conn:
+        plan_id = kb.create_task(
+            conn,
+            title="review implementation plan",
+            assignee="echlon-coder",
+            task_mode="plan-only",
+        )
+        qa_id = kb.create_task(
+            conn,
+            title="qa existing pr",
+            assignee="echlon-qa",
+            task_mode="qa_only",
+        )
+
+        plan = kb.get_task(conn, plan_id)
+        qa = kb.get_task(conn, qa_id)
+        assert plan.task_mode == "plan_only"
+        assert qa.task_mode == "qa_only"
+
+        plan_context = kb.build_worker_context(conn, plan_id)
+        qa_context = kb.build_worker_context(conn, qa_id)
+
+    assert "Mode:     plan_only" in plan_context
+    assert "PLAN-ONLY / READ-ONLY" in plan_context
+    assert "implementation_started=false" in plan_context
+    assert "changed_files=[]" in plan_context
+    assert "Mode:     qa_only" in qa_context
+    assert "QA-ONLY / READ-ONLY" in qa_context
+    assert "exact head SHA" in qa_context
+
+
+def test_list_tasks_filters_by_task_mode(kanban_home):
+    with kb.connect() as conn:
+        kb.create_task(conn, title="plan", assignee="a", task_mode="plan_only")
+        kb.create_task(conn, title="qa", assignee="a", task_mode="qa_only")
+
+        rows = kb.list_tasks(conn, task_mode="plan-only")
+
+    assert [row.title for row in rows] == ["plan"]
+
+
+def test_invalid_task_mode_is_rejected(kanban_home):
+    with kb.connect() as conn:
+        with pytest.raises(ValueError, match="task_mode must be one of"):
+            kb.create_task(conn, title="bad", assignee="a", task_mode="freeform")

@@ -133,6 +133,32 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 # not dispatcher spawn/crash/timeout failures.
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
+VALID_TASK_MODES = {
+    "default",
+    "plan_only",
+    "implementation",
+    "qa_only",
+    "qa_gate",
+    "correction",
+    "srdja_handoff",
+}
+
+
+def normalize_task_mode(mode: Optional[str]) -> str:
+    """Normalize a Kanban task execution contract/mode.
+
+    ``default`` preserves legacy behavior. Non-default modes are intentionally
+    lightweight metadata plus worker-context guardrails: dispatch still follows
+    assignee/status, while the mode makes standalone planning and QA lanes
+    machine-readable without creating new boards or profiles.
+    """
+    value = str(mode or "").strip().lower().replace("-", "_")
+    if not value:
+        return "default"
+    if value not in VALID_TASK_MODES:
+        allowed = ", ".join(sorted(VALID_TASK_MODES))
+        raise ValueError(f"task_mode must be one of {allowed}, got {mode!r}")
+    return value
 
 
 def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
@@ -920,6 +946,7 @@ class Task:
     claim_lock: Optional[str]
     claim_expires: Optional[int]
     tenant: Optional[str]
+    task_mode: str = "default"
     branch_name: Optional[str] = None
     project_id: Optional[str] = None
     result: Optional[str] = None
@@ -1024,6 +1051,7 @@ class Task:
             claim_lock=row["claim_lock"],
             claim_expires=row["claim_expires"],
             tenant=row["tenant"] if "tenant" in keys else None,
+            task_mode=normalize_task_mode(row["task_mode"] if "task_mode" in keys else None),
             result=row["result"] if "result" in keys else None,
             idempotency_key=row["idempotency_key"] if "idempotency_key" in keys else None,
             consecutive_failures=(
@@ -1203,6 +1231,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     claim_lock           TEXT,
     claim_expires        INTEGER,
     tenant               TEXT,
+    -- Execution contract for independently runnable planning / implementation / QA lanes.
+    -- The dispatcher still routes by assignee/status; this field is surfaced to
+    -- workers and clients so plan-only and QA-only work do not have to be
+    -- children of the implementation workflow.
+    task_mode            TEXT NOT NULL DEFAULT 'default',
     result               TEXT,
     idempotency_key      TEXT,
     -- Unified consecutive-failure counter. Incremented on spawn
@@ -2458,6 +2491,16 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             conn, "tasks", "session_id", "session_id TEXT"
         )
 
+    if "task_mode" not in cols:
+        # Lightweight execution contract for standalone plan/QA lanes. Existing
+        # rows get default legacy behavior.
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "task_mode",
+            "task_mode TEXT NOT NULL DEFAULT 'default'",
+        )
+
     if "block_kind" not in cols:
         # Typed block reason (VALID_BLOCK_KINDS) or NULL for legacy/un-typed
         # blocks. Existing blocked rows get NULL, which is treated as a
@@ -2903,6 +2946,7 @@ def create_task(
     goal_max_turns: Optional[int] = None,
     initial_status: str = "running",
     session_id: Optional[str] = None,
+    task_mode: Optional[str] = None,
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
@@ -2949,6 +2993,7 @@ def create_task(
     model_override = (model_override or "").strip() or None
     provider_override = (provider_override or "").strip() or None
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
+    task_mode_value = normalize_task_mode(task_mode)
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
     assignee = _canonical_assignee(assignee)
@@ -3213,12 +3258,12 @@ def create_task(
                     INSERT INTO tasks (
                         id, title, body, assignee, status, priority,
                         created_by, created_at, workspace_kind, workspace_path,
-                        branch_name, project_id, tenant, idempotency_key,
+                        branch_name, project_id, tenant, task_mode, idempotency_key,
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
                         goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3234,6 +3279,7 @@ def create_task(
                         branch_name,
                         project_id,
                         tenant,
+                        task_mode_value,
                         idempotency_key,
                         int(max_runtime_seconds) if max_runtime_seconds is not None else None,
                         json.dumps(skills_list) if skills_list is not None else None,
@@ -3260,6 +3306,7 @@ def create_task(
                         "status": task_status,
                         "parents": list(parents),
                         "tenant": tenant,
+                        "task_mode": task_mode_value,
                         "workspace_kind": workspace_kind,
                         "workspace_path": workspace_path,
                         "branch_name": branch_name,
@@ -3365,6 +3412,7 @@ def list_tasks(
     order_by: Optional[str] = None,
     workflow_template_id: Optional[str] = None,
     current_step_key: Optional[str] = None,
+    task_mode: Optional[str] = None,
 ) -> list[Task]:
     query = "SELECT * FROM tasks WHERE 1=1"
     params: list[Any] = []
@@ -3388,6 +3436,9 @@ def list_tasks(
     if current_step_key is not None:
         query += " AND current_step_key = ?"
         params.append(current_step_key)
+    if task_mode is not None:
+        query += " AND task_mode = ?"
+        params.append(normalize_task_mode(task_mode))
     if not include_archived and status != "archived":
         query += " AND status != 'archived'"
     if order_by is not None:
@@ -9235,6 +9286,58 @@ def run_daemon(
         stop_event.wait(timeout=interval)
 
 
+def _task_mode_contract(task_mode: str) -> str:
+    """Return worker-facing side-effect guidance for special task modes."""
+    mode = normalize_task_mode(task_mode)
+    if mode == "plan_only":
+        return (
+            "PLAN-ONLY / READ-ONLY. Do not implement, edit repository files, "
+            "create branches, commit, push, open or update PRs, mutate Linear, "
+            "rerun CodeRabbit, post to Slack/GitHub, create downstream Kanban "
+            "cards, or change config/cron/gateway behavior unless the card "
+            "explicitly says that side effect is approved. Produce a source-backed "
+            "plan or adversarial review, durable artifact paths when applicable, "
+            "and completion metadata with implementation_started=false, "
+            "changed_files=[], and external_side_effects=none."
+        )
+    if mode == "qa_only":
+        return (
+            "QA-ONLY / READ-ONLY. Review the named PR, branch, diff, plan, or "
+            "artifact independently; do not require an implementation parent card. "
+            "Bind any verdict to exact source evidence (for PRs: repo, PR number, "
+            "base, head branch, exact head SHA, checks, and review/CodeRabbit state). "
+            "Do not change code or create correction cards unless separately "
+            "approved. Complete with APPROVE, BLOCK, NEEDS_IMPLEMENTATION, or "
+            "NEEDS_MORE_SOURCE plus changed_files=[] and external_side_effects=none."
+        )
+    if mode == "qa_gate":
+        return (
+            "QA GATE AFTER IMPLEMENTATION. Treat the upstream implementation card "
+            "and current reviewed artifact/head as the gate input. Verify the exact "
+            "current head/artifact, mark stale evidence explicitly, and return an "
+            "approval/block verdict. If blocking, describe the correction scope for "
+            "the orchestrator/coder; do not merge."
+        )
+    if mode == "implementation":
+        return (
+            "IMPLEMENTATION MODE. Perform only the implementation side effects "
+            "explicitly authorized by the card, then provide changed files, checks, "
+            "artifacts, and required downstream QA handoff metadata."
+        )
+    if mode == "correction":
+        return (
+            "CORRECTION MODE. Apply only the bounded follow-up scope from QA, "
+            "CodeRabbit, CI, or human review; avoid unrelated cleanup and preserve "
+            "the requested branch/PR constraints."
+        )
+    if mode == "srdja_handoff":
+        return (
+            "SRDJA HANDOFF MODE. Prepare/reconcile the human-review packet only. "
+            "Do not merge, deploy, or treat packet creation as human approval."
+        )
+    return ""
+
+
 # ---------------------------------------------------------------------------
 # Worker context builder (what a spawned worker sees)
 # ---------------------------------------------------------------------------
@@ -9285,6 +9388,8 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     lines.append("")
     lines.append(f"Assignee: {task.assignee or '(unassigned)'}")
     lines.append(f"Status:   {task.status}")
+    if task.task_mode != "default":
+        lines.append(f"Mode:     {task.task_mode}")
     if task.tenant:
         lines.append(f"Tenant:   {task.tenant}")
     lines.append(f"Workspace: {task.workspace_kind} @ {task.workspace_path or '(unresolved)'}")
@@ -9300,6 +9405,12 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     if task.branch_name:
         lines.append(f"Branch:   {task.branch_name}")
     lines.append("")
+
+    mode_contract = _task_mode_contract(task.task_mode)
+    if mode_contract:
+        lines.append("## Mode contract")
+        lines.append(mode_contract)
+        lines.append("")
 
     if task.body and task.body.strip():
         lines.append("## Body")
