@@ -65,6 +65,7 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "status": t.status,
         "priority": t.priority,
         "tenant": t.tenant,
+        "task_mode": t.task_mode,
         "workspace_kind": t.workspace_kind,
         "workspace_path": t.workspace_path,
         "branch_name": t.branch_name,
@@ -343,6 +344,18 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "worktree under the project's primary repo with a "
                                "deterministic branch. See `hermes project list`.")
     p_create.add_argument("--tenant", default=None, help="Tenant namespace")
+    p_create.add_argument(
+        "--mode",
+        choices=sorted(kb.VALID_TASK_MODES),
+        default="default",
+        dest="task_mode",
+        help=(
+            "Execution contract for this card. Use plan_only for independent "
+            "read-only planning/adversarial review, qa_only for standalone QA, "
+            "qa_gate for post-implementation QA, implementation/correction for "
+            "code lanes, and srdja_handoff for human-review packets."
+        ),
+    )
     p_create.add_argument("--priority", type=int, default=0, help="Priority tiebreaker")
     p_create.add_argument("--triage", action="store_true",
                           help="Park in triage — a specifier will flesh out the spec and promote to todo")
@@ -430,6 +443,13 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_list.add_argument("--status", default=None,
                         choices=sorted(kb.VALID_STATUSES))
     p_list.add_argument("--tenant", default=None)
+    p_list.add_argument(
+        "--mode",
+        choices=sorted(kb.VALID_TASK_MODES),
+        default=None,
+        dest="task_mode",
+        help="Restrict to tasks with this execution contract/mode",
+    )
     p_list.add_argument("--session", default=None,
                         help="Filter by originating chat/agent session id "
                              "(set on tasks created from inside an ACP loop)")
@@ -1507,6 +1527,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             branch_name=branch_name,
             project_id=getattr(args, "project", None),
             tenant=args.tenant,
+            task_mode=getattr(args, "task_mode", "default"),
             priority=args.priority,
             parents=tuple(args.parent or ()),
             triage=bool(getattr(args, "triage", False)),
@@ -1585,6 +1606,7 @@ def _cmd_list(args: argparse.Namespace) -> int:
             status=args.status,
             tenant=args.tenant,
             session_id=args.session,
+            task_mode=getattr(args, "task_mode", None),
             include_archived=args.archived,
             order_by=getattr(args, "sort", None),
             workflow_template_id=args.workflow_template_id,
@@ -1683,6 +1705,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
     print(f"  assignee:  {task.assignee or '-'}")
     if task.tenant:
         print(f"  tenant:    {task.tenant}")
+    if task.task_mode != "default":
+        print(f"  mode:      {task.task_mode}")
     print(f"  workspace: {task.workspace_kind}" +
           (f" @ {task.workspace_path}" if task.workspace_path else ""))
     if task.branch_name:
