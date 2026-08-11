@@ -49,20 +49,28 @@ def _init_git_repo(repo: Path) -> None:
 
 
 
+@pytest.mark.windows_only
 def test_cross_process_init_lock_uses_windows_byte_range_lock(tmp_path, monkeypatch):
     """Windows must use a real (non-blocking) process lock, not a no-op open.
 
     The init lock acquires with LK_NBLCK in a bounded retry loop (#36644) so a
     wedged holder can never block connect() forever; a clean acquire takes the
     lock once and releases it once.
+
+    ``windows_only``: ``msvcrt`` does not exist off Windows, so faking
+    ``_IS_WINDOWS`` on Linux meant injecting a fake ``msvcrt`` module too —
+    the test then asserted against its own stub rather than the byte-range
+    locking API. Here the platform is real; only ``msvcrt.locking`` is
+    instrumented so the call sequence is observable.
     """
     calls: list[tuple[int, int, int]] = []
+    import msvcrt as _msvcrt
+
     fake_msvcrt = types.SimpleNamespace(
-        LK_NBLCK=3,
-        LK_UNLCK=2,
+        LK_NBLCK=_msvcrt.LK_NBLCK,
+        LK_UNLCK=_msvcrt.LK_UNLCK,
         locking=lambda fd, mode, nbytes: calls.append((fd, mode, nbytes)),
     )
-    monkeypatch.setattr(kb, "_IS_WINDOWS", True)
     monkeypatch.setitem(sys.modules, "msvcrt", fake_msvcrt)
 
     db_path = tmp_path / "kanban.db"
@@ -1583,3 +1591,51 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     # Still usable after with-block exit (the leak).
     conn.execute("SELECT 1").fetchone()
     conn.close()  # explicit close to avoid leaking THIS test
+
+
+def test_task_mode_persists_and_surfaces_worker_contract(kanban_home):
+    with kb.connect() as conn:
+        plan_id = kb.create_task(
+            conn,
+            title="review implementation plan",
+            assignee="echlon-coder",
+            task_mode="plan-only",
+        )
+        qa_id = kb.create_task(
+            conn,
+            title="qa existing pr",
+            assignee="echlon-qa",
+            task_mode="qa_only",
+        )
+
+        plan = kb.get_task(conn, plan_id)
+        qa = kb.get_task(conn, qa_id)
+        assert plan.task_mode == "plan_only"
+        assert qa.task_mode == "qa_only"
+
+        plan_context = kb.build_worker_context(conn, plan_id)
+        qa_context = kb.build_worker_context(conn, qa_id)
+
+    assert "Mode:     plan_only" in plan_context
+    assert "PLAN-ONLY / READ-ONLY" in plan_context
+    assert "implementation_started=false" in plan_context
+    assert "changed_files=[]" in plan_context
+    assert "Mode:     qa_only" in qa_context
+    assert "QA-ONLY / READ-ONLY" in qa_context
+    assert "exact head SHA" in qa_context
+
+
+def test_list_tasks_filters_by_task_mode(kanban_home):
+    with kb.connect() as conn:
+        kb.create_task(conn, title="plan", assignee="a", task_mode="plan_only")
+        kb.create_task(conn, title="qa", assignee="a", task_mode="qa_only")
+
+        rows = kb.list_tasks(conn, task_mode="plan-only")
+
+    assert [row.title for row in rows] == ["plan"]
+
+
+def test_invalid_task_mode_is_rejected(kanban_home):
+    with kb.connect() as conn:
+        with pytest.raises(ValueError, match="task_mode must be one of"):
+            kb.create_task(conn, title="bad", assignee="a", task_mode="freeform")
