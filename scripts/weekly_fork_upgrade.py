@@ -172,7 +172,7 @@ def main(argv: list[str] | None = None) -> int:
         fd = acquire_lock(lock)
     except FileExistsError:
         write_report(report_path, "Hermes fork weekly upgrade - BLOCKED", [*report_lines, f"- Blocker: lock exists at `{lock}`"])
-        print(f"Hermes fork upgrade BLOCKED: another run is active. Report: {report_path}")
+        print("Hermes fork upgrade BLOCKED — another run is active. Evidence saved internally.")
         return 2
 
     try:
@@ -182,7 +182,7 @@ def main(argv: list[str] | None = None) -> int:
             report_lines.append("- Fork policy: BLOCKED")
             report_lines.extend(f"  - {r}" for r in guard.reasons)
             write_report(report_path, "Hermes fork weekly upgrade - BLOCKED", report_lines)
-            print(f"Hermes fork upgrade BLOCKED: fork policy failed. Report: {report_path}")
+            print("Hermes fork upgrade BLOCKED — fork policy failed. Why it matters: upgrades must stay fork-only; NousResearch remains read-only. Evidence saved internally.")
             return 2
         ensure_remote(repo, VENDOR_REMOTE, "NousResearch", "hermes-agent", push_required=False)
         ensure_remote(repo, FORK_REMOTE, "msreadbot", "hermes-agent", push_required=True)
@@ -195,7 +195,7 @@ def main(argv: list[str] | None = None) -> int:
             report_lines.append(status_short)
             report_lines.append("```")
             write_report(report_path, "Hermes fork weekly upgrade - BLOCKED", report_lines)
-            print(f"Hermes fork upgrade BLOCKED: live checkout has uncommitted changes. Report: {report_path}")
+            print("Hermes fork upgrade BLOCKED — live checkout has uncommitted changes. Decision: clean/stash/commit local work before preparing upgrade. Why it matters: upgrade prep must not mix with unrelated edits. Evidence saved internally.")
             return 2
 
         hermes_version = run(["hermes", "--version"], cwd=repo, check=False).stdout.strip()
@@ -234,14 +234,14 @@ def main(argv: list[str] | None = None) -> int:
             status = "NO_CHANGE"
             write_report(report_path, "Hermes fork weekly upgrade - NO_CHANGE", report_lines)
             if args.print_no_change:
-                print(f"Hermes fork upgrade NO_CHANGE. Report: {report_path}")
+                print("Hermes fork upgrade — no change. No Monty decision needed. Evidence saved internally.")
             return 0
 
         if not args.prepare:
             status = "BLOCKED"
             report_lines.append("- Recommendation: upstream changed; rerun with `--prepare` to create an isolated fork branch.")
             write_report(report_path, "Hermes fork weekly upgrade - BLOCKED", report_lines)
-            print(f"Hermes fork upgrade needs preparation. Report: {report_path}")
+            print("Hermes fork upgrade — decision needed. Decision: approve preparing an isolated fork upgrade branch. Why it matters: upstream changed; deploy remains manual. Evidence saved internally.")
             return 1
 
         branch = "upgrade/vendor-" + dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d")
@@ -249,7 +249,7 @@ def main(argv: list[str] | None = None) -> int:
         if not candidate_head:
             status = "BLOCKED"
             write_report(report_path, "Hermes fork weekly upgrade - MERGE_BLOCKED", report_lines)
-            print(f"Hermes fork upgrade BLOCKED: merge conflicts on {candidate_branch}. Report: {report_path}")
+            print("Hermes fork upgrade BLOCKED — merge conflicts. Decision: approve manual conflict resolution or skip this week. Why it matters: automated upgrade cannot safely reconcile this. Evidence saved internally.")
             return 2
 
         candidate_worktree = hermes_home() / "worktrees" / "hermes-upgrades" / branch.replace("/", "-")
@@ -262,7 +262,7 @@ def main(argv: list[str] | None = None) -> int:
         if gates.returncode != 0:
             status = "BLOCKED"
             write_report(report_path, "Hermes fork weekly upgrade - GATE_BLOCKED", report_lines)
-            print(f"Hermes fork upgrade BLOCKED: candidate conformance gates failed. Report: {report_path}")
+            print("Hermes fork upgrade BLOCKED — conformance gates failed. Decision: fix the candidate branch before review. Why it matters: upgrade is not safe to review/deploy yet. Evidence saved internally.")
             return 2
 
         pr_url = None
@@ -281,13 +281,13 @@ def main(argv: list[str] | None = None) -> int:
                 report_lines.append("- Internal PR: BLOCKED by fork target guard")
                 report_lines.extend(f"  - {r}" for r in pr_guard.reasons)
                 write_report(report_path, "Hermes fork weekly upgrade - PR_GUARD_BLOCKED", report_lines)
-                print(f"Hermes fork upgrade BLOCKED: internal PR target guard failed. Report: {report_path}")
+                print("Hermes fork upgrade BLOCKED — internal PR target guard failed. Why it matters: fork-only policy prevented unsafe targeting. Evidence saved internally.")
                 return 2
             if shutil.which("gh") is None:
                 status = "BLOCKED"
                 report_lines.append("- Internal PR: BLOCKED, `gh` not installed")
                 write_report(report_path, "Hermes fork weekly upgrade - GH_MISSING", report_lines)
-                print(f"Hermes fork upgrade BLOCKED: gh is required for --open-pr. Report: {report_path}")
+                print("Hermes fork upgrade BLOCKED — GitHub CLI unavailable. Decision: restore gh access or run prep without PR creation. Evidence saved internally.")
                 return 2
             else:
                 push = run(["git", "push", FORK_REMOTE, f"HEAD:{branch}"], cwd=candidate_worktree, check=False)
@@ -298,7 +298,7 @@ def main(argv: list[str] | None = None) -> int:
                 if push.returncode != 0:
                     status = "BLOCKED"
                     write_report(report_path, "Hermes fork weekly upgrade - PUSH_BLOCKED", report_lines)
-                    print(f"Hermes fork upgrade BLOCKED: fork branch push failed. Report: {report_path}")
+                    print("Hermes fork upgrade BLOCKED — fork branch push failed. Decision: fix GitHub push/auth before review. Evidence saved internally.")
                     return 2
                 pr_body = artifact_dir() / f"{ts}-internal-pr-body.md"
                 pr_body.write_text("\n".join(report_lines), encoding="utf-8")
@@ -333,26 +333,26 @@ def main(argv: list[str] | None = None) -> int:
                         report_lines.append(pr.stdout.strip())
                         report_lines.append("```")
                         write_report(report_path, "Hermes fork weekly upgrade - PR_BLOCKED", report_lines)
-                        print(f"Hermes fork upgrade BLOCKED: internal PR create failed. Report: {report_path}")
+                        print("Hermes fork upgrade BLOCKED — internal PR create failed. Decision: fix GitHub PR/auth issue or create PR manually. Evidence saved internally.")
                         return 2
 
         status = "PREPARED_INTERNAL_BRANCH"
         write_report(report_path, f"Hermes fork weekly upgrade - {status}", report_lines)
         summary_lines.append(f"Hermes fork upgrade {status}")
-        summary_lines.append(f"Branch: `{candidate_branch}`")
-        summary_lines.append(f"Head: `{candidate_head}`")
+        summary_lines.append("Decision: review the internal fork PR/branch; deploy remains manual.")
+        summary_lines.append("Why it matters: upstream changed; this keeps NousResearch read-only and our fork isolated.")
         if pr_url:
             summary_lines.append(f"PR: {pr_url}")
-        summary_lines.append(f"Approval channel: `{args.approval_channel}`")
-        summary_lines.append(f"Report: `{report_path}`")
-        summary_lines.append("Decision needed: review the internal fork branch/PR; deploy remains manual.")
+        summary_lines.append("Confirmed: branch prepared and conformance gates passed.")
+        summary_lines.append("Evidence saved internally.")
+        summary_lines.append("Next: review/merge the PR if it looks right; no deploy/restart is included.")
         print("\n".join(summary_lines))
         return 0
     except Exception as exc:
         status = "FAILED"
         report_lines.append(f"- Error: `{type(exc).__name__}: {exc}`")
         write_report(report_path, "Hermes fork weekly upgrade - FAILED", report_lines)
-        print(f"Hermes fork upgrade FAILED: {type(exc).__name__}: {exc}. Report: {report_path}")
+        print(f"Hermes fork upgrade FAILED — {type(exc).__name__}: {exc}. Evidence saved internally.")
         return 2
     finally:
         try:
