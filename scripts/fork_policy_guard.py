@@ -31,7 +31,13 @@ class GuardResult:
 
 
 def _run_git(repo: Path, args: list[str]) -> str:
-    return subprocess.check_output(["git", "-C", str(repo), *args], text=True, stderr=subprocess.STDOUT)
+    return subprocess.check_output(
+        ["git", "-C", str(repo), *args],
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        stderr=subprocess.STDOUT,
+    )
 
 
 def parse_remote_v(text: str) -> dict[str, dict[str, list[str]]]:
