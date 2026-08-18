@@ -33,6 +33,7 @@ import qrcode from 'qrcode-terminal';
 import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
 import { createOutboundIdTracker } from './outbound_ids.js';
 import { classifyOwnerMessageGate } from './owner_message_gate.js';
+import { createSourceSpool } from './source_spool.js';
 import {
   buildPollPayload,
   createReconnectScheduler,
@@ -83,6 +84,15 @@ const SEND_READ_RECEIPTS =
   process.env &&
   typeof process.env.WHATSAPP_SEND_READ_RECEIPTS === 'string' &&
   ['1', 'true', 'yes', 'on'].includes(process.env.WHATSAPP_SEND_READ_RECEIPTS.toLowerCase());
+const OUTBOUND_DISABLED =
+  typeof process !== 'undefined' &&
+  process.env &&
+  typeof process.env.WHATSAPP_OUTBOUND_DISABLED === 'string' &&
+  ['1', 'true', 'yes', 'on'].includes(process.env.WHATSAPP_OUTBOUND_DISABLED.toLowerCase());
+
+// Opt-in passive mirror. This callback only appends allowlisted group events
+// to local JSONL; it has no WhatsApp or agent-send capability.
+const SOURCE_SPOOL = createSourceSpool();
 
 const PORT = parseInt(getArg('port', '3000'), 10);
 const SESSION_DIR = getArg('session', path.join(process.env.HOME || '~', '.hermes', 'whatsapp', 'session'));
@@ -734,6 +744,17 @@ async function startSocket() {
         },
       });
       event.fromOwner = fromOwner;
+      if (SOURCE_SPOOL) {
+        try { SOURCE_SPOOL(event); } catch (error) {
+          console.warn('[whatsapp-source-spool] write failed:', error.message);
+        }
+      }
+
+      // Passive source-spool group messages are capture-only. Do not enqueue
+      // them for gateway/agent handling, regardless of bridge mode.
+      if (event.isGroup && event.passiveSpool) {
+        continue;
+      }
 
       // Ignore Hermes' own reply messages in self-chat mode to avoid loops.
       if (msg.key.fromMe && ((REPLY_PREFIX && event.body.startsWith(REPLY_PREFIX)) || recentlySentIds.has(msg.key.id))) {
@@ -824,6 +845,9 @@ app.post('/send', async (req, res) => {
   if (!sock || connectionState !== 'connected') {
     return res.status(503).json({ error: 'Not connected to WhatsApp' });
   }
+  if (OUTBOUND_DISABLED) {
+    return res.status(403).json({ error: 'WhatsApp outbound is disabled on this bridge' });
+  }
 
   const { chatId, message, replyTo } = req.body;
   if (!chatId || !message) {
@@ -863,6 +887,9 @@ app.post('/edit', async (req, res) => {
   if (!sock || connectionState !== 'connected') {
     return res.status(503).json({ error: 'Not connected to WhatsApp' });
   }
+  if (OUTBOUND_DISABLED) {
+    return res.status(403).json({ error: 'WhatsApp outbound is disabled on this bridge' });
+  }
 
   const { chatId, messageId, message } = req.body;
   if (!chatId || !messageId || !message) {
@@ -896,6 +923,9 @@ app.post('/edit', async (req, res) => {
 app.post('/send-media', async (req, res) => {
   if (!sock || connectionState !== 'connected') {
     return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+  if (OUTBOUND_DISABLED) {
+    return res.status(403).json({ error: 'WhatsApp outbound is disabled on this bridge' });
   }
 
   const { chatId, filePath, mediaType, caption, fileName } = req.body;
@@ -1020,6 +1050,9 @@ app.post('/send-location', async (req, res) => {
   if (!sock || connectionState !== 'connected') {
     return res.status(503).json({ error: 'Not connected to WhatsApp' });
   }
+  if (OUTBOUND_DISABLED) {
+    return res.status(403).json({ error: 'WhatsApp outbound is disabled on this bridge' });
+  }
 
   const { chatId, latitude, longitude, name, address } = req.body;
   if (!chatId || latitude === undefined || longitude === undefined) {
@@ -1111,6 +1144,7 @@ app.get('/health', (req, res) => {
     uptime: process.uptime(),
     scriptHash: SCRIPT_HASH,
     sendReadReceipts: SEND_READ_RECEIPTS,
+    outboundDisabled: OUTBOUND_DISABLED,
   });
 });
 

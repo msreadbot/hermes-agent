@@ -57,6 +57,19 @@ def test_kanban_list_json_includes_session_id(kanban_home):
     )
 
 
+def test_kanban_show_text_renders_graph_with_open_connection(kanban_home):
+    with kb.connect_closing() as conn:
+        parent_id = kb.create_task(conn, title="parent task")
+        child_id = kb.create_task(conn, title="child task")
+        kb.link_tasks(conn, parent_id=parent_id, child_id=child_id)
+
+    output = kc.run_slash(f"show {child_id}")
+
+    assert f"Task {child_id}: child task" in output
+    assert f"parents:   {parent_id}" in output
+    assert "Cannot operate on a closed database" not in output
+
+
 def test_board_override_is_isolated_per_concurrent_call(kanban_home, monkeypatch):
     kb.create_board("alpha")
     kb.create_board("beta")
@@ -166,3 +179,27 @@ def test_run_slash_reclaim_running_task(kanban_home):
 # ---------------------------------------------------------------------------
 
 
+
+
+def test_kanban_create_and_list_support_task_mode(kanban_home):
+    create_raw = kc.run_slash(
+        "create 'standalone plan' --assignee echlon-coder --mode plan_only --json"
+    )
+    created = json.loads(create_raw)
+    assert created["task_mode"] == "plan_only"
+
+    list_raw = kc.run_slash("list --mode plan_only --json")
+    listed = json.loads(list_raw)
+    assert [row["title"] for row in listed] == ["standalone plan"]
+    assert listed[0]["task_mode"] == "plan_only"
+
+
+def test_kanban_show_prints_non_default_task_mode(kanban_home):
+    raw = kc.run_slash(
+        "create 'standalone qa' --assignee echlon-qa --mode qa_only --json"
+    )
+    tid = json.loads(raw)["id"]
+
+    shown = kc.run_slash(f"show {tid}")
+
+    assert "mode:      qa_only" in shown
